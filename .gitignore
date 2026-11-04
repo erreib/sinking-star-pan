@@ -1,0 +1,7 @@
+dist/*.log
+dist/unload.flag
+dist/sinking_star_pan_dev*.dll
+dist/*.zip
+shots/
+tools/wincap
+*.o
