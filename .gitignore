@@ -5,3 +5,4 @@ dist/*.zip
 shots/
 tools/wincap
 *.o
+__pycache__/
