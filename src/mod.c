@@ -30,7 +30,7 @@ static char g_dir[MAX_PATH], g_log_path[MAX_PATH], g_ini_path[MAX_PATH], g_unloa
 
 // --- config -------------------------------------------------------------------------------
 static int   cfg_mode_move = 1;    // 1 = view follows the mouse position (no click), 0 = click and drag
-static float cfg_gain = 1.0f;      // move mode: cursor at the window edge = gain * half a screen of pan
+static float cfg_gain = 1.3f;      // move mode: cursor at the window edge = gain * half a screen of pan
 static float cfg_smooth = 0.08f;   // move mode: easing time constant in seconds
 static int   cfg_button = VK_LBUTTON;
 static int   cfg_invert_x = 0, cfg_invert_y = 0;
@@ -54,8 +54,8 @@ static void load_config(void) {
     char buf[64];
     GetPrivateProfileStringA("pan", "mode", "move", buf, sizeof buf, g_ini_path);
     cfg_mode_move = _stricmp(buf, "drag") != 0;
-    GetPrivateProfileStringA("pan", "gain", "1.0", buf, sizeof buf, g_ini_path);
-    cfg_gain = (float)atof(buf); if (!(cfg_gain > 0.01f)) cfg_gain = 1.0f;
+    GetPrivateProfileStringA("pan", "gain", "1.3", buf, sizeof buf, g_ini_path);
+    cfg_gain = (float)atof(buf); if (!(cfg_gain > 0.01f)) cfg_gain = 1.3f;
     GetPrivateProfileStringA("pan", "smoothing", "0.08", buf, sizeof buf, g_ini_path);
     cfg_smooth = (float)atof(buf); if (!(cfg_smooth >= 0.0f)) cfg_smooth = 0.08f;
     GetPrivateProfileStringA("pan", "button", "left", buf, sizeof buf, g_ini_path);
@@ -124,13 +124,57 @@ static uint8_t   g_hook_orig[HOOK_LEN];
 static uint8_t  *g_tramp = NULL;
 static volatile float *g_off_x = NULL, *g_off_y = NULL;   // live offsets read by the trampoline
 static volatile uint32_t *g_hits = NULL;                   // how often the trampoline ran
+static volatile float g_target_x = 0.0f, g_target_y = 0.0f; // where the worker thread wants the view
+static volatile int   g_snap = 0;                          // 1 = jump to the target instead of easing
+
+// Runs on the game thread, once per frame, right before the camera routine reads the bounds.
+// Easing here (with the real frame time) instead of on the polling thread keeps the motion
+// smooth: the thread's ticks never line up with frames, which showed up as small skips.
+static void pan_tick(void) {
+    static LARGE_INTEGER freq, last;
+    static float ex = 0.0f, ey = 0.0f;
+    LARGE_INTEGER now;
+    if (!freq.QuadPart) { QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&last); }
+    QueryPerformanceCounter(&now);
+    float dt = (float)(now.QuadPart - last.QuadPart) / (float)freq.QuadPart;
+    last = now;
+    if (!(dt > 0.0f)) dt = 0.0f;
+    if (dt > 0.1f) dt = 0.1f;
+    float tx = g_target_x, ty = g_target_y;
+    float k = (g_snap || cfg_smooth <= 0.0005f) ? 1.0f : 1.0f - expf(-dt / cfg_smooth);
+    ex += (tx - ex) * k; ey += (ty - ey) * k;
+    if (fabsf(ex) < 0.0005f) ex = 0.0f;
+    if (fabsf(ey) < 0.0005f) ey = 0.0f;
+    *g_off_x = ex; *g_off_y = ey;
+}
 
 static int build_trampoline(uintptr_t site) {
     g_tramp = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!g_tramp) return 0;
     uint8_t *t = g_tramp; size_t i = 0;
-    const size_t data = 0x80;                                   // 16-byte aligned: (offx, offy, 0, 0), then hits
-    // movsd xmm2,[r13+0x6c]; movsd xmm1,[r13+0x74]
+    const size_t data = 0x100;                                  // 16-byte aligned: (offx, offy, 0, 0), then hits
+    // --- call pan_tick() with the Windows x64 volatile state preserved ---
+    static const uint8_t save[] = {
+        0x50, 0x51, 0x52, 0x41,0x50, 0x41,0x51, 0x41,0x52, 0x41,0x53,   // push rax rcx rdx r8 r9 r10 r11
+        0x48,0x89,0xE0,                                                 // mov rax,rsp
+        0x48,0x81,0xEC,0xA0,0x00,0x00,0x00,                             // sub rsp,0xA0
+        0x48,0x83,0xE4,0xF0,                                            // and rsp,-16
+        0x48,0x89,0x84,0x24,0x90,0x00,0x00,0x00,                        // mov [rsp+0x90],rax
+        0x0F,0x11,0x44,0x24,0x20, 0x0F,0x11,0x4C,0x24,0x30,             // movups [rsp+0x20],xmm0 / +0x30,xmm1
+        0x0F,0x11,0x54,0x24,0x40, 0x0F,0x11,0x5C,0x24,0x50,             // xmm2 / xmm3
+        0x0F,0x11,0x64,0x24,0x60, 0x0F,0x11,0x6C,0x24,0x70,             // xmm4 / xmm5
+        0x48,0xB8 };                                                    // mov rax, imm64 (follows)
+    static const uint8_t restore[] = {
+        0xFF,0xD0,                                                      // call rax
+        0x0F,0x10,0x44,0x24,0x20, 0x0F,0x10,0x4C,0x24,0x30,
+        0x0F,0x10,0x54,0x24,0x40, 0x0F,0x10,0x5C,0x24,0x50,
+        0x0F,0x10,0x64,0x24,0x60, 0x0F,0x10,0x6C,0x24,0x70,             // movups xmm0..5 back
+        0x48,0x8B,0xA4,0x24,0x90,0x00,0x00,0x00,                        // mov rsp,[rsp+0x90]
+        0x41,0x5B, 0x41,0x5A, 0x41,0x59, 0x41,0x58, 0x5A, 0x59, 0x58 }; // pop r11 r10 r9 r8 rdx rcx rax
+    memcpy(t + i, save, sizeof save); i += sizeof save;
+    { uint64_t fn = (uint64_t)(uintptr_t)&pan_tick; memcpy(t + i, &fn, 8); i += 8; }
+    memcpy(t + i, restore, sizeof restore); i += sizeof restore;
+    // --- original: movsd xmm2,[r13+0x6c]; movsd xmm1,[r13+0x74] ---
     memcpy(t + i, k_hook_pat, 12); i += 12;
     // addps xmm2,[rip+disp]   0F 58 15 disp32
     t[i++] = 0x0F; t[i++] = 0x58; t[i++] = 0x15;
@@ -275,13 +319,9 @@ static DWORD WINAPI worker(LPVOID arg) {
             if (pannable && focused) {
                 POINT c = cur; ScreenToClient(g_hwnd, &c);
                 float cx = (float)(rc.right - rc.left) * 0.5f, cy = (float)client_h * 0.5f;
-                float tx = ((float)c.x - cx) * wpp * cfg_gain, ty = -((float)c.y - cy) * wpp * cfg_gain;
-                if (cfg_invert_x) tx = -tx;
-                if (cfg_invert_y) ty = -ty;
-                float m = sqrtf(tx * tx + ty * ty);
-                if (m > cfg_max_offset) { tx *= cfg_max_offset / m; ty *= cfg_max_offset / m; }
-                float k = cfg_smooth > 0.0005f ? 1.0f - expf(-0.008f / cfg_smooth) : 1.0f;
-                off_x += (tx - off_x) * k; off_y += (ty - off_y) * k;
+                off_x = ((float)c.x - cx) * wpp * cfg_gain; off_y = -((float)c.y - cy) * wpp * cfg_gain;
+                if (cfg_invert_x) off_x = -off_x;
+                if (cfg_invert_y) off_y = -off_y;
             }
         } else if (pannable && focused && down) {
             if (!dragging) { dragging = 1; last = cur; if (cfg_debug) mlog("drag start mode=%u at (%ld,%ld)", mode, cur.x, cur.y); }
@@ -290,16 +330,16 @@ static DWORD WINAPI worker(LPVOID arg) {
                 // content follows the cursor: drag right -> camera moves left (-x); drag down -> camera moves north (+y)
                 off_x += cfg_invert_x ? dx : -dx;
                 off_y += cfg_invert_y ? -dy : dy;
-                float m = sqrtf(off_x * off_x + off_y * off_y);
-                if (m > cfg_max_offset) { off_x *= cfg_max_offset / m; off_y *= cfg_max_offset / m; }
                 last = cur;
             }
         } else if (dragging) { dragging = 0; if (cfg_debug) mlog("drag end offset=(%.2f, %.2f)", off_x, off_y); }
+        { float m = sqrtf(off_x * off_x + off_y * off_y);
+          if (m > cfg_max_offset) { off_x *= cfg_max_offset / m; off_y *= cfg_max_offset / m; } }
 
-        // Leaving the overhead view: fade the offset out with the game's own transition, then forget it.
+        // Leaving the overhead view: ease the offset out with the game's own transition, then forget it.
         float scale = pannable ? 1.0f : blend;
-        if (!pannable && blend <= 0.001f) off_x = off_y = 0;
-        *g_off_x = off_x * scale; *g_off_y = off_y * scale;
+        if (!pannable && blend <= 0.001f) { off_x = off_y = 0; g_snap = 1; } else g_snap = 0;
+        g_target_x = off_x * scale; g_target_y = off_y * scale;
 
         DWORD now = GetTickCount();
         if (cfg_debug && (mode != last_mode || now - last_log > 2000)) {
@@ -310,8 +350,10 @@ static DWORD WINAPI worker(LPVOID arg) {
             last_mode = mode; last_log = now;
         }
     }
-    *g_off_x = 0; *g_off_y = 0;
+    g_target_x = g_target_y = 0; g_snap = 1;
     remove_hook();
+    Sleep(200);   // nothing can enter pan_tick any more; let any thread already inside it finish
+    *g_off_x = 0; *g_off_y = 0;
     mlog("detached");
     if (!g_running) return 0;
     FreeLibraryAndExitThread(g_self, 0);
