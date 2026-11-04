@@ -29,6 +29,9 @@ static volatile int g_running = 1;
 static char g_dir[MAX_PATH], g_log_path[MAX_PATH], g_ini_path[MAX_PATH], g_unload_path[MAX_PATH];
 
 // --- config -------------------------------------------------------------------------------
+static int   cfg_mode_move = 1;    // 1 = view follows the mouse position (no click), 0 = click and drag
+static float cfg_gain = 1.0f;      // move mode: cursor at the window edge = gain * half a screen of pan
+static float cfg_smooth = 0.08f;   // move mode: easing time constant in seconds
 static int   cfg_button = VK_LBUTTON;
 static int   cfg_invert_x = 0, cfg_invert_y = 0;
 static float cfg_sensitivity = 1.0f;
@@ -49,6 +52,12 @@ static void mlog(const char *fmt, ...) {
 
 static void load_config(void) {
     char buf[64];
+    GetPrivateProfileStringA("pan", "mode", "move", buf, sizeof buf, g_ini_path);
+    cfg_mode_move = _stricmp(buf, "drag") != 0;
+    GetPrivateProfileStringA("pan", "gain", "1.0", buf, sizeof buf, g_ini_path);
+    cfg_gain = (float)atof(buf); if (!(cfg_gain > 0.01f)) cfg_gain = 1.0f;
+    GetPrivateProfileStringA("pan", "smoothing", "0.08", buf, sizeof buf, g_ini_path);
+    cfg_smooth = (float)atof(buf); if (!(cfg_smooth >= 0.0f)) cfg_smooth = 0.08f;
     GetPrivateProfileStringA("pan", "button", "left", buf, sizeof buf, g_ini_path);
     cfg_button = !_stricmp(buf, "right") ? VK_RBUTTON : !_stricmp(buf, "middle") ? VK_MBUTTON : VK_LBUTTON;
     cfg_invert_x = GetPrivateProfileIntA("pan", "invert_x", 0, g_ini_path);
@@ -222,8 +231,9 @@ static DWORD WINAPI worker(LPVOID arg) {
     MODULEINFO mi = {0};
     GetModuleInformation(GetCurrentProcess(), exe, &mi, sizeof mi);
     uintptr_t base = (uintptr_t)exe;
-    mlog("sinking_star_pan attached: exe base 0x%llx size 0x%lx | button=%s invert=(%d,%d) sens=%.2f modes=0x%x",
-         (unsigned long long)base, mi.SizeOfImage, cfg_button == VK_RBUTTON ? "right" : cfg_button == VK_MBUTTON ? "middle" : "left",
+    mlog("sinking_star_pan attached: exe base 0x%llx size 0x%lx | mode=%s gain=%.2f smoothing=%.2f button=%s invert=(%d,%d) sens=%.2f modes=0x%x",
+         (unsigned long long)base, mi.SizeOfImage, cfg_mode_move ? "move" : "drag", cfg_gain, cfg_smooth,
+         cfg_button == VK_RBUTTON ? "right" : cfg_button == VK_MBUTTON ? "middle" : "left",
          cfg_invert_x, cfg_invert_y, cfg_sensitivity, cfg_modes);
     uintptr_t g = find_state_global(base, mi.SizeOfImage);
     if (!g) { mlog("could not find the game state pointer; giving up"); return 0; }
@@ -243,7 +253,8 @@ static DWORD WINAPI worker(LPVOID arg) {
 
         uint8_t mode = *(uint8_t *)(em + OFF_VIEW_MODE);
         float blend = *(float *)(em + OFF_BLEND);
-        if (!(blend >= 0.0f)) blend = 0.0f; if (blend > 1.0f) blend = 1.0f;
+        if (!(blend >= 0.0f)) blend = 0.0f;
+        if (blend > 1.0f) blend = 1.0f;
         int pannable = (cfg_modes >> mode) & 1 && mode != 0;
         V3 cam = *(V3 *)(em + OFF_CAM_POS);
         float fov = *(float *)(em + OFF_CAM_FOV);
@@ -257,12 +268,25 @@ static DWORD WINAPI worker(LPVOID arg) {
         POINT cur; GetCursorPos(&cur);
         int down = (GetAsyncKeyState(cfg_button) & 0x8000) != 0;
 
-        if (pannable && focused && down) {
+        float height = cam.z - floor_z; if (!(height > 1.0f)) height = cam.z; if (!(height > 1.0f)) height = 80.0f;
+        float wpp = 2.0f * tanf(fov * 0.5f) * height / (float)client_h;   // world units per pixel
+        if (cfg_mode_move) {
+            // The view follows the cursor: cursor right of centre -> camera moves right (+x), below centre -> south (-y).
+            if (pannable && focused) {
+                POINT c = cur; ScreenToClient(g_hwnd, &c);
+                float cx = (float)(rc.right - rc.left) * 0.5f, cy = (float)client_h * 0.5f;
+                float tx = ((float)c.x - cx) * wpp * cfg_gain, ty = -((float)c.y - cy) * wpp * cfg_gain;
+                if (cfg_invert_x) tx = -tx;
+                if (cfg_invert_y) ty = -ty;
+                float m = sqrtf(tx * tx + ty * ty);
+                if (m > cfg_max_offset) { tx *= cfg_max_offset / m; ty *= cfg_max_offset / m; }
+                float k = cfg_smooth > 0.0005f ? 1.0f - expf(-0.008f / cfg_smooth) : 1.0f;
+                off_x += (tx - off_x) * k; off_y += (ty - off_y) * k;
+            }
+        } else if (pannable && focused && down) {
             if (!dragging) { dragging = 1; last = cur; if (cfg_debug) mlog("drag start mode=%u at (%ld,%ld)", mode, cur.x, cur.y); }
             else {
-                float height = cam.z - floor_z; if (!(height > 1.0f)) height = cam.z; if (!(height > 1.0f)) height = 80.0f;
-                float wpp = 2.0f * tanf(fov * 0.5f) * height / (float)client_h * cfg_sensitivity;   // world units per pixel
-                float dx = (float)(cur.x - last.x) * wpp, dy = (float)(cur.y - last.y) * wpp;
+                float dx = (float)(cur.x - last.x) * wpp * cfg_sensitivity, dy = (float)(cur.y - last.y) * wpp * cfg_sensitivity;
                 // content follows the cursor: drag right -> camera moves left (-x); drag down -> camera moves north (+y)
                 off_x += cfg_invert_x ? dx : -dx;
                 off_y += cfg_invert_y ? -dy : dy;

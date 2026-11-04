@@ -14,9 +14,14 @@ running game and patched out again when it unloads.
 2. Run `SinkingStarPanInjector.exe`. It starts the game through Steam if it is
    not already running, waits for it, and loads `sinking_star_pan.dll` into it.
    If the game is already running it just loads the mod.
-3. In the game, press **Q** to open the local area view, then hold the **left
-   mouse button** and drag. The map follows the cursor. Press **Q** again to
-   close the view; the camera goes back to where the game wants it.
+3. In the game, press **Q** to open the local area view, then just move the
+   mouse: the view follows the cursor. With the cursor at the right edge of the
+   window you see half a screen further to the right, and so on; bring the
+   cursor back to the middle to recentre. Press **Q** again to close the view;
+   the camera goes back to where the game wants it.
+
+If you prefer to click and drag the map instead, set `mode = drag` in
+`config.ini`.
 
 The DLL writes `sinking_star_pan.log` next to itself. If something does not
 work, that file says why.
@@ -35,9 +40,12 @@ Edit `config.ini` next to the DLL (read when the mod loads):
 
 | key | default | meaning |
 |---|---|---|
-| `button` | `left` | mouse button that drags: `left`, `right` or `middle` |
-| `invert_x`, `invert_y` | `0` | set to `1` to flip a drag direction |
-| `sensitivity` | `1.0` | drag speed; `1.0` keeps the map under the cursor |
+| `mode` | `move` | `move`: the view follows the mouse position, no clicking; `drag`: hold a button and drag the map |
+| `gain` | `1.0` | move mode: how far the view goes when the cursor reaches the window edge, in half-screens |
+| `smoothing` | `0.08` | move mode: easing time in seconds (`0` = instant) |
+| `button` | `left` | drag mode: mouse button that drags: `left`, `right` or `middle` |
+| `sensitivity` | `1.0` | drag mode: drag speed; `1.0` keeps the map under the cursor |
+| `invert_x`, `invert_y` | `0` | set to `1` to flip a direction (either mode) |
 | `max_offset` | `500` | how far (in world units) the view may be dragged from where the game put it |
 | `modes` | `2` | which overhead views may be dragged: `2` is the local area view (Q); add `1` to try the full map view as well |
 | `[log] enabled` | `1` | write the log file |
@@ -87,9 +95,10 @@ player's cell every frame, so writing to them from a thread would race. Instead
 the DLL patches the three instructions that read the bounds inside the camera
 routine with a jump to a small trampoline that adds the pan offset to both
 corners before the game uses them. A polling thread turns mouse drags into that
-offset (pixels are converted to world units from the camera height, field of
-view and window size), scales it with the blend while the view closes, and
-clears it afterwards.
+offset (in move mode from the cursor's position relative to the window centre,
+in drag mode from accumulated mouse motion; pixels are converted to world units
+from the camera height, field of view and window size), scales it with the
+blend while the view closes, and clears it afterwards.
 
 The pointer to the game state is found from the prologue of the overhead-map
 toggle handlers; the hook site is found by its byte pattern.
