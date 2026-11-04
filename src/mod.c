@@ -160,8 +160,26 @@ static void pan_tick(void) {
         avg += (raw - avg) * 0.1f;
     }
     float tx = g_target_x, ty = g_target_y;
+    // Under Wine the cursor position arrives in bursts (several frames with no change, then a big
+    // step), which the easing alone turns into visible speed swings. Estimate the target's velocity
+    // from its changes and carry the motion forward a little between updates.
+    static float ltx = 0, lty = 0, vx = 0, vy = 0; static double tchange = 0, tnow = 0;
+    tnow = (double)now.QuadPart / (double)freq.QuadPart;
+    if (tx != ltx || ty != lty) {
+        double gap = tnow - tchange;
+        if (gap > 0.004 && gap < 0.15) {
+            float nvx = (tx - ltx) / (float)gap, nvy = (ty - lty) / (float)gap;
+            vx += (nvx - vx) * 0.5f; vy += (nvy - vy) * 0.5f;
+        } else { vx = vy = 0; }
+        ltx = tx; lty = ty; tchange = tnow;
+    }
+    float since = (float)(tnow - tchange);
+    if (since > 0.12f || g_snap) { vx = vy = 0; }
+    else { vx *= 0.97f; vy *= 0.97f; }
+    float lead = since < 0.06f ? since : 0.06f;        // at most ~2 frames of prediction
+    float px = tx + vx * lead, py = ty + vy * lead;
     float k = (g_snap || cfg_smooth <= 0.0005f) ? 1.0f : 1.0f - expf(-dt / cfg_smooth);
-    ex += (tx - ex) * k; ey += (ty - ey) * k;
+    ex += (px - ex) * k; ey += (py - ey) * k;
     if (fabsf(ex) < 0.0005f) ex = 0.0f;
     if (fabsf(ey) < 0.0005f) ey = 0.0f;
     *g_off_x = ex; *g_off_y = ey;

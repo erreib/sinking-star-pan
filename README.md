@@ -106,8 +106,11 @@ in drag mode from accumulated mouse motion; pixels are converted to world units
 from the camera height, field of view and window size), scales it with the
 blend while the view closes, and clears it afterwards. The trampoline also
 calls a small C function once per frame, on the game thread, that eases the
-offset toward that target using the real frame time, so the motion is smooth
-regardless of how the polling thread's ticks line up with frames.
+offset toward that target using a smoothed frame time, so the motion is even
+regardless of how the polling thread's ticks line up with frames. Because the
+cursor position can arrive in bursts (under Wine it only advances when the game
+pumps its message queue), the easing also estimates the target's velocity and
+carries the motion forward for up to two frames between updates.
 
 The pointer to the game state is found from the prologue of the overhead-map
 toggle handlers; the hook site is found by its byte pattern.
