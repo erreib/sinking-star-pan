@@ -15,10 +15,12 @@ running game and patched out again when it unloads.
    not already running, waits for it, and loads `sinking_star_pan.dll` into it.
    If the game is already running it just loads the mod.
 3. In the game, press **Q** to open the local area view, then just move the
-   mouse: the view follows the cursor. With the cursor at the right edge of the
-   window you see about two thirds of a screen further to the right, and so on;
-   bring the cursor back to the middle to recentre. Press **Q** again to close the view;
-   the camera goes back to where the game wants it.
+   mouse: the view follows it. Opening the view puts the cursor in the middle
+   of the window and starts on the player; moving the mouse to the edge of the
+   window shows about two thirds of a screen further in that direction, and
+   moving back to the middle recentres. Press **Q** again to close the view;
+   the camera goes back to the player, and the next time you open the view it
+   starts on the player again.
 
 If you prefer to click and drag the map instead, set `mode = drag` in
 `config.ini`.
@@ -43,6 +45,7 @@ Edit `config.ini` next to the DLL (read when the mod loads):
 | `mode` | `move` | `move`: the view follows the mouse position, no clicking; `drag`: hold a button and drag the map |
 | `gain` | `1.3` | move mode: how far the view goes when the cursor reaches the window edge, in half-screens (`1.0` = half a screen, `2.0` = a full screen) |
 | `smoothing` | `0.08` | move mode: easing time in seconds (`0` = instant) |
+| `recenter_cursor` | `1` | move mode: warp the cursor to the window centre when the view opens, so the full range is available in every direction |
 | `button` | `left` | drag mode: mouse button that drags: `left`, `right` or `middle` |
 | `sensitivity` | `1.0` | drag mode: drag speed; `1.0` keeps the map under the cursor |
 | `invert_x`, `invert_y` | `0` | set to `1` to flip a direction (either mode) |
@@ -73,7 +76,10 @@ Known limits:
 - Panning only applies to the local area view. The full map view has its own
   camera path and is not changed.
 - In areas where the designers placed camera limiters, the game may clamp the
-  view back toward the limiter region while you drag.
+  view back toward the limiter region while you pan.
+- Motion is only as smooth as the game's frame rate. The view is eased once per
+  rendered frame with a smoothed frame time, but at 30 fps with uneven frame
+  pacing a moving camera still shows some judder; a lower render preset helps.
 
 ## How it works
 

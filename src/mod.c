@@ -32,6 +32,7 @@ static char g_dir[MAX_PATH], g_log_path[MAX_PATH], g_ini_path[MAX_PATH], g_unloa
 static int   cfg_mode_move = 1;    // 1 = view follows the mouse position (no click), 0 = click and drag
 static float cfg_gain = 1.3f;      // move mode: cursor at the window edge = gain * half a screen of pan
 static float cfg_smooth = 0.08f;   // move mode: easing time constant in seconds
+static int   cfg_recenter = 1;     // move mode: warp the cursor to the window centre when the view opens
 static int   cfg_button = VK_LBUTTON;
 static int   cfg_invert_x = 0, cfg_invert_y = 0;
 static float cfg_sensitivity = 1.0f;
@@ -58,6 +59,7 @@ static void load_config(void) {
     cfg_gain = (float)atof(buf); if (!(cfg_gain > 0.01f)) cfg_gain = 1.3f;
     GetPrivateProfileStringA("pan", "smoothing", "0.08", buf, sizeof buf, g_ini_path);
     cfg_smooth = (float)atof(buf); if (!(cfg_smooth >= 0.0f)) cfg_smooth = 0.08f;
+    cfg_recenter = GetPrivateProfileIntA("pan", "recenter_cursor", 1, g_ini_path);
     GetPrivateProfileStringA("pan", "button", "left", buf, sizeof buf, g_ini_path);
     cfg_button = !_stricmp(buf, "right") ? VK_RBUTTON : !_stricmp(buf, "middle") ? VK_MBUTTON : VK_LBUTTON;
     cfg_invert_x = GetPrivateProfileIntA("pan", "invert_x", 0, g_ini_path);
@@ -126,6 +128,12 @@ static volatile float *g_off_x = NULL, *g_off_y = NULL;   // live offsets read b
 static volatile uint32_t *g_hits = NULL;                   // how often the trampoline ran
 static volatile float g_target_x = 0.0f, g_target_y = 0.0f; // where the worker thread wants the view
 static volatile int   g_snap = 0;                          // 1 = jump to the target instead of easing
+static volatile uintptr_t g_state = 0;                     // game state (for the trace)
+
+// Per-frame trace for diagnosing motion quality (dumped on request when debug logging is on).
+typedef struct { double t; float dt, tx, ex, raw, avg, midx; } Trace;
+#define TRACE_N 1024
+static Trace g_trace[TRACE_N]; static volatile unsigned g_trace_n = 0;
 
 // Runs on the game thread, once per frame, right before the camera routine reads the bounds.
 // Easing here (with the real frame time) instead of on the polling thread keeps the motion
@@ -136,16 +144,44 @@ static void pan_tick(void) {
     LARGE_INTEGER now;
     if (!freq.QuadPart) { QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&last); }
     QueryPerformanceCounter(&now);
-    float dt = (float)(now.QuadPart - last.QuadPart) / (float)freq.QuadPart;
+    float raw = (float)(now.QuadPart - last.QuadPart) / (float)freq.QuadPart;
     last = now;
-    if (!(dt > 0.0f)) dt = 0.0f;
-    if (dt > 0.1f) dt = 0.1f;
+    if (!(raw > 0.0f)) raw = 0.0f;
+    if (raw > 0.1f) raw = 0.1f;
+    // Smooth the frame time: a late frame would otherwise move the view a long way in one step,
+    // which reads as a skip. Use a running average and keep each frame within 30% of it.
+    static float avg = 0.0f;
+    float dt = raw;
+    if (raw > 0.002f) {                          // ignore back-to-back calls within the same frame
+        if (avg <= 0.0f) avg = raw;
+        float lo = avg * 0.7f, hi = avg * 1.3f;
+        if (dt < lo) dt = lo;
+        if (dt > hi) dt = hi;
+        avg += (raw - avg) * 0.1f;
+    }
     float tx = g_target_x, ty = g_target_y;
     float k = (g_snap || cfg_smooth <= 0.0005f) ? 1.0f : 1.0f - expf(-dt / cfg_smooth);
     ex += (tx - ex) * k; ey += (ty - ey) * k;
     if (fabsf(ex) < 0.0005f) ex = 0.0f;
     if (fabsf(ey) < 0.0005f) ey = 0.0f;
     *g_off_x = ex; *g_off_y = ey;
+    if (cfg_debug) {
+        Trace *tr = &g_trace[g_trace_n % TRACE_N];
+        tr->t = (double)now.QuadPart / (double)freq.QuadPart; tr->dt = dt; tr->tx = tx; tr->ex = ex;
+        tr->raw = raw; tr->avg = avg;
+        uintptr_t st = g_state;
+        tr->midx = st ? (*(float *)(st + OFF_BOUNDS) + *(float *)(st + OFF_BOUNDS + 8)) * 0.5f : 0;
+        g_trace_n++;
+    }
+}
+
+static void dump_trace(void) {
+    unsigned n = g_trace_n, from = n > TRACE_N ? n - TRACE_N : 0;
+    FILE *f = fopen(g_log_path, "a"); if (!f) return;
+    fprintf(f, "--- trace (%u frames): t dt tx ex raw_dt avg_dt midx\n", n - from);
+    for (unsigned i = from; i < n; i++) { Trace *tr = &g_trace[i % TRACE_N];
+        fprintf(f, "%.4f %.4f %.3f %.3f %.4f %.4f %.3f\n", tr->t, tr->dt, tr->tx, tr->ex, tr->raw, tr->avg, tr->midx); }
+    fclose(f);
 }
 
 static int build_trampoline(uintptr_t site) {
@@ -285,7 +321,7 @@ static DWORD WINAPI worker(LPVOID arg) {
     if (!install_hook(base, mi.SizeOfImage)) return 0;
 
     float off_x = 0, off_y = 0;         // accumulated pan, world units
-    int dragging = 0; POINT last = {0};
+    int dragging = 0; POINT last = {0}, origin = {0}; int was_pannable = 0;
     uint8_t last_mode = 0xFF; DWORD last_log = 0; uintptr_t last_em = 0;
     while (g_running) {
         Sleep(8);
@@ -294,6 +330,9 @@ static DWORD WINAPI worker(LPVOID arg) {
         uintptr_t em = *(uintptr_t *)g;
         if (!em || !readable((void *)em, STATE_SIZE)) continue;
         if (em != last_em) { off_x = off_y = 0; last_em = em; }
+        g_state = em;
+        { char flag[MAX_PATH]; snprintf(flag, MAX_PATH, "%strace.flag", g_dir);
+          if (cfg_debug && GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES) { DeleteFileA(flag); dump_trace(); } }
 
         uint8_t mode = *(uint8_t *)(em + OFF_VIEW_MODE);
         float blend = *(float *)(em + OFF_BLEND);
@@ -315,13 +354,23 @@ static DWORD WINAPI worker(LPVOID arg) {
         float height = cam.z - floor_z; if (!(height > 1.0f)) height = cam.z; if (!(height > 1.0f)) height = 80.0f;
         float wpp = 2.0f * tanf(fov * 0.5f) * height / (float)client_h;   // world units per pixel
         if (cfg_mode_move) {
-            // The view follows the cursor: cursor right of centre -> camera moves right (+x), below centre -> south (-y).
+            // The view follows the mouse from where the cursor was when the view opened (the cursor is
+            // warped to the window centre at that moment, so the full range is available in every
+            // direction): mouse right -> camera moves right (+x), mouse down -> south (-y).
             if (pannable && focused) {
-                POINT c = cur; ScreenToClient(g_hwnd, &c);
-                float cx = (float)(rc.right - rc.left) * 0.5f, cy = (float)client_h * 0.5f;
-                off_x = ((float)c.x - cx) * wpp * cfg_gain; off_y = -((float)c.y - cy) * wpp * cfg_gain;
-                if (cfg_invert_x) off_x = -off_x;
-                if (cfg_invert_y) off_y = -off_y;
+                if (!was_pannable) {
+                    POINT c; GetCursorPos(&c);
+                    if (cfg_recenter && g_hwnd) {
+                        c.x = (rc.left + rc.right) / 2; c.y = (rc.top + rc.bottom) / 2;
+                        ClientToScreen(g_hwnd, &c); SetCursorPos(c.x, c.y); cur = c;
+                    }
+                    origin = c; off_x = off_y = 0;
+                    if (cfg_debug) mlog("view opened: origin (%ld,%ld)", origin.x, origin.y);
+                } else {
+                    off_x = (float)(cur.x - origin.x) * wpp * cfg_gain; off_y = -(float)(cur.y - origin.y) * wpp * cfg_gain;
+                    if (cfg_invert_x) off_x = -off_x;
+                    if (cfg_invert_y) off_y = -off_y;
+                }
             }
         } else if (pannable && focused && down) {
             if (!dragging) { dragging = 1; last = cur; if (cfg_debug) mlog("drag start mode=%u at (%ld,%ld)", mode, cur.x, cur.y); }
@@ -340,6 +389,7 @@ static DWORD WINAPI worker(LPVOID arg) {
         float scale = pannable ? 1.0f : blend;
         if (!pannable && blend <= 0.001f) { off_x = off_y = 0; g_snap = 1; } else g_snap = 0;
         g_target_x = off_x * scale; g_target_y = off_y * scale;
+        was_pannable = pannable && focused;
 
         DWORD now = GetTickCount();
         if (cfg_debug && (mode != last_mode || now - last_log > 2000)) {
